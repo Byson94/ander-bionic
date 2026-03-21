@@ -3,16 +3,24 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <unistd.h>
 #include <jni.h>
 #include "include/jnienv.h"
 #include "include/ipc.h"
 
-// Global socket fd set by main
 extern int g_socket_fd;
 extern uint32_t g_current_call_id;
 
-// Generic JNIEnv proxy — sends method name + raw args over socket
-// Java side handles it with the real JNIEnv
+static int read_all_fd(int fd, void *buf, size_t len) {
+    uint8_t *p = buf;
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+        if (n <= 0) return -1;
+        p += n; len -= n;
+    }
+    return 0;
+}
+
 static int64_t proxy_jnienv(const char *method, const void *args, uint32_t args_len) {
     uint32_t mlen  = strlen(method) + 1;
     uint32_t total = mlen + args_len;
@@ -22,17 +30,40 @@ static int64_t proxy_jnienv(const char *method, const void *args, uint32_t args_
     msg_send(g_socket_fd, MSG_JNIENV, g_current_call_id, payload, total);
     free(payload);
 
-    // Wait for JNIENV_RETURN
-    MsgHeader hdr;
-    uint8_t buf[65536];
+    int64_t result = 0;
     while (1) {
-        if (msg_recv(g_socket_fd, &hdr, buf, sizeof(buf)) < 0) return 0;
-        if (hdr.type == MSG_JNIENV_RETURN && hdr.id == g_current_call_id) {
-            int64_t result = 0;
-            if (hdr.data_len >= 8) memcpy(&result, buf, 8);
-            return result;
+        MsgHeader hdr;
+        if (read_all_fd(g_socket_fd, &hdr, sizeof(MsgHeader)) < 0) break;
+        if (hdr.id != g_current_call_id) continue;
+
+        if (hdr.type == MSG_JNIENV_RETURN) {
+            uint8_t buf[8] = {0};
+            if (hdr.data_len > 0 && read_all_fd(g_socket_fd, buf, hdr.data_len < 8 ? hdr.data_len : 8) < 0) break;
+            memcpy(&result, buf, 8);
+            break;
+        }
+
+        if (hdr.type == MSG_JNIENV_RETURN_DATA) {
+            // Dynamically allocate — payload can be larger than 65536
+            uint8_t *buf = malloc(hdr.data_len);
+            if (!buf) break;
+            if (read_all_fd(g_socket_fd, buf, hdr.data_len) < 0) { free(buf); break; }
+            fprintf(stderr, "[jnienv] RETURN_DATA dlen=%u\n", hdr.data_len);
+            fflush(stderr);
+            // Skip 8-byte handle, return pointer to actual data
+            result = (int64_t)(intptr_t)(buf + 8);
+            // buf intentionally not freed — caller owns the data
+            break;
+        }
+
+        // Drain unknown message
+        if (hdr.data_len > 0) {
+            uint8_t *tmp = malloc(hdr.data_len);
+            if (tmp) { read_all_fd(g_socket_fd, tmp, hdr.data_len); free(tmp); }
         }
     }
+
+    return result;
 }
 
 static jint proxy_GetVersion(JNIEnv * a0) {
@@ -786,8 +817,8 @@ static void proxy_ReleaseStringChars(JNIEnv* a0, jstring a1, const jchar* a2) {
 }
 
 static jstring proxy_NewStringUTF(JNIEnv* a0, const char* a1) {
-    // TODO: marshal args into payload
-    int64_t r = proxy_jnienv("NewStringUTF", NULL, 0);
+    uint32_t len = a1 ? strlen(a1) + 1 : 1;
+    int64_t r = proxy_jnienv("NewStringUTF", a1 ? a1 : "", len);
     return (jstring)(intptr_t)r;
 }
 
@@ -962,8 +993,11 @@ static void proxy_GetStringUTFRegion(JNIEnv* a0, jstring a1, jsize a2, jsize a3,
 }
 
 static void* proxy_GetPrimitiveArrayCritical(JNIEnv* a0, jarray a1, jboolean* a2) {
-    // TODO: marshal args into payload
-    int64_t r = proxy_jnienv("GetPrimitiveArrayCritical", NULL, 0);
+    fprintf(stderr, "[jnienv] GetPrimitiveArrayCritical arr=%p\n", (void*)a1);
+    fflush(stderr);
+    int64_t r = proxy_jnienv("GetPrimitiveArrayCritical", &a1, sizeof(a1));
+    fprintf(stderr, "[jnienv] GetPrimitiveArrayCritical result=%p\n", (void*)r);
+    fflush(stderr);
     return (void*)(intptr_t)r;
 }
 
@@ -1001,8 +1035,15 @@ static jboolean proxy_ExceptionCheck(JNIEnv* a0) {
 }
 
 static jobject proxy_NewDirectByteBuffer(JNIEnv* a0, void* a1, jlong a2) {
-    // TODO: marshal args into payload
-    int64_t r = proxy_jnienv("NewDirectByteBuffer", NULL, 0);
+    // Send: address(8) + capacity(8) + actual buffer data
+    uint32_t cap = (uint32_t)a2;
+    uint32_t payload_len = sizeof(a1) + sizeof(a2) + cap;
+    uint8_t *payload = malloc(payload_len);
+    memcpy(payload,                    &a1,  sizeof(a1));
+    memcpy(payload + sizeof(a1),       &a2,  sizeof(a2));
+    memcpy(payload + sizeof(a1) + sizeof(a2), a1, cap);  // copy actual data
+    int64_t r = proxy_jnienv("NewDirectByteBuffer", payload, payload_len);
+    free(payload);
     return (jobject)(intptr_t)r;
 }
 

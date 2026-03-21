@@ -51,13 +51,30 @@ int msg_recv(int fd, MsgHeader *hdr, void *buf, uint32_t buf_size) {
     return 0;
 }
 
+typedef struct { char *buf; uint32_t offset; uint32_t capacity; } ListCtx;
+
+static void collect_java_symbols(const char *name, void *udata) {
+    ListCtx *ctx = udata;
+    if (strncmp(name, "Java_", 5) != 0) return;
+    size_t len = strlen(name) + 1;
+    if (ctx->offset + len + 1 >= ctx->capacity) return;
+    memcpy(ctx->buf + ctx->offset, name, len);
+    ctx->offset += len;
+}
+
 // IPC loop
 void ipc_serve(int client_fd) {
     MsgHeader hdr;
     uint8_t *buf = malloc(BUF_SIZE);
     if (!buf) return;
 
+    fprintf(stdout, "ipc_serve: starting loop\n");
+    fflush(stdout);
+
     while (1) {
+        fprintf(stdout, "ipc_serve: waiting for message\n");
+        fflush(stdout);
+
         if (msg_recv(client_fd, &hdr, buf, BUF_SIZE) < 0) {
             fprintf(stderr, "client disconnected\n");
             break;
@@ -107,7 +124,16 @@ void ipc_serve(int client_fd) {
                 msg_send(client_fd, MSG_RETURN, hdr.id, &ret, sizeof(ret));
                 break;
             }
-
+            case MSG_LIST_SYMBOLS: {
+                char *out = malloc(BUF_SIZE);
+                if (!out) break;
+                ListCtx ctx = { out, 0, BUF_SIZE };
+                symbols_foreach(collect_java_symbols, &ctx);
+                out[ctx.offset++] = '\0';
+                msg_send(client_fd, MSG_RETURN, hdr.id, out, ctx.offset);
+                free(out);
+                break;
+            }
             default:
                 fprintf(stderr, "unknown message type: 0x%02x\n", hdr.type);
                 break;
