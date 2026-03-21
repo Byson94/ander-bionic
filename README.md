@@ -9,5 +9,3 @@ The `launcher` binary in the root of this project is supposed to be used for loa
 ```bash
 $ qemu-aarch64 -L ./sysroot ./launcher /path/to/your.so
 ```
-
-Additionally, the `launcher.c` file and the `test-arm.c` file is supposed to be compiled against bionic using the `aarch64-linux-android29-clang` binary provided by Android NDK. Otherwise, it will fail to load.
