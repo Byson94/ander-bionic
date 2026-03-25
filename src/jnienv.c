@@ -10,6 +10,10 @@
 
 extern int g_socket_fd;
 extern uint32_t g_current_call_id;
+static jsize g_last_crit_size = 0;
+
+ProxyDirectBuf g_direct_bufs[MAX_DIRECT_BUFS];
+int            g_direct_buf_count = 0;
 
 static int read_all_fd(int fd, void *buf, size_t len) {
     uint8_t *p = buf;
@@ -22,6 +26,9 @@ static int read_all_fd(int fd, void *buf, size_t len) {
 }
 
 static int64_t proxy_jnienv(const char *method, const void *args, uint32_t args_len) {
+    fprintf(stderr, "Got call to proxy_jnienv\n");
+    fflush(stderr);
+
     uint32_t mlen  = strlen(method) + 1;
     uint32_t total = mlen + args_len;
     uint8_t *payload = malloc(total);
@@ -44,15 +51,14 @@ static int64_t proxy_jnienv(const char *method, const void *args, uint32_t args_
         }
 
         if (hdr.type == MSG_JNIENV_RETURN_DATA) {
-            // Dynamically allocate — payload can be larger than 65536
+            // Dynamically allocate
             uint8_t *buf = malloc(hdr.data_len);
             if (!buf) break;
             if (read_all_fd(g_socket_fd, buf, hdr.data_len) < 0) { free(buf); break; }
-            fprintf(stderr, "[jnienv] RETURN_DATA dlen=%u\n", hdr.data_len);
-            fflush(stderr);
             // Skip 8-byte handle, return pointer to actual data
+            g_last_crit_size = (jsize)(hdr.data_len - 8);
             result = (int64_t)(intptr_t)(buf + 8);
-            // buf intentionally not freed — caller owns the data
+            // buf intentionally not freed (caller owns the data)
             break;
         }
 
@@ -73,8 +79,9 @@ static jint proxy_GetVersion(JNIEnv * a0) {
 }
 
 static jclass proxy_FindClass(JNIEnv* a0, const char* a1) {
-    // TODO: marshal args into payload
-    int64_t r = proxy_jnienv("FindClass", NULL, 0);
+    uint32_t len = a1 ? strlen(a1) + 1 : 1;
+    const char *name = a1 ? a1 : "";
+    int64_t r = proxy_jnienv("FindClass", name, len);
     return (jclass)(intptr_t)r;
 }
 
@@ -160,9 +167,10 @@ static jobject proxy_PopLocalFrame(JNIEnv* a0, jobject a1) {
 }
 
 static jobject proxy_NewGlobalRef(JNIEnv* a0, jobject a1) {
-    // TODO: marshal args into payload
-    int64_t r = proxy_jnienv("NewGlobalRef", NULL, 0);
-    return (jobject)(intptr_t)r;
+    if (!a1) return NULL;
+    uint64_t ref = (uint64_t)(uintptr_t)a1;
+    int64_t r = proxy_jnienv("NewGlobalRef", &ref, sizeof(ref));
+    return (jobject)(uintptr_t)r;
 }
 
 static void proxy_DeleteGlobalRef(JNIEnv* a0, jobject a1) {
@@ -218,9 +226,10 @@ static jobject proxy_NewObjectA(JNIEnv* a0, jclass a1, jmethodID a2, const jvalu
 }
 
 static jclass proxy_GetObjectClass(JNIEnv* a0, jobject a1) {
-    // TODO: marshal args into payload
-    int64_t r = proxy_jnienv("GetObjectClass", NULL, 0);
-    return (jclass)(intptr_t)r;
+    if (!a1) return NULL;
+    uint64_t ref = (uint64_t)(uintptr_t)a1;
+    int64_t r = proxy_jnienv("GetObjectClass", &ref, sizeof(ref));
+    return (jclass)(uintptr_t)r;
 }
 
 static jboolean proxy_IsInstanceOf(JNIEnv* a0, jobject a1, jclass a2) {
@@ -230,9 +239,20 @@ static jboolean proxy_IsInstanceOf(JNIEnv* a0, jobject a1, jclass a2) {
 }
 
 static jmethodID proxy_GetMethodID(JNIEnv* a0, jclass a1, const char* a2, const char* a3) {
-    // TODO: marshal args into payload
-    int64_t r = proxy_jnienv("GetMethodID", NULL, 0);
-    return (jmethodID)(intptr_t)r;
+    if (!a1) return NULL;
+    size_t name_len = strlen(a2) + 1;
+    size_t sig_len  = strlen(a3) + 1;
+    size_t buf_size = sizeof(uint64_t) + name_len + sig_len;
+    uint8_t *buf = malloc(buf_size);
+
+    uint64_t ref = (uint64_t)(uintptr_t)a1;
+    memcpy(buf, &ref, sizeof(ref));
+    memcpy(buf + sizeof(ref), a2, name_len);
+    memcpy(buf + sizeof(ref) + name_len, a3, sig_len);
+
+    int64_t r = proxy_jnienv("GetMethodID", buf, buf_size);
+    free(buf);
+    return (jmethodID)(uintptr_t)r;
 }
 
 static jobject proxy_CallObjectMethod(JNIEnv* a0, jobject a1, jmethodID a2, ...) {
@@ -818,7 +838,8 @@ static void proxy_ReleaseStringChars(JNIEnv* a0, jstring a1, const jchar* a2) {
 
 static jstring proxy_NewStringUTF(JNIEnv* a0, const char* a1) {
     uint32_t len = a1 ? strlen(a1) + 1 : 1;
-    int64_t r = proxy_jnienv("NewStringUTF", a1 ? a1 : "", len);
+    const char *str = a1 ? a1 : "";
+    int64_t r = proxy_jnienv("NewStringUTF", str, len);
     return (jstring)(intptr_t)r;
 }
 
@@ -992,18 +1013,41 @@ static void proxy_GetStringUTFRegion(JNIEnv* a0, jstring a1, jsize a2, jsize a3,
     int64_t r = proxy_jnienv("GetStringUTFRegion", NULL, 0);
 }
 
+#define MAX_CRIT_ARRAYS 64
+static struct { void *ptr; jsize size; } g_crit_arrays[MAX_CRIT_ARRAYS];
+static int g_crit_count = 0;
+
 static void* proxy_GetPrimitiveArrayCritical(JNIEnv* a0, jarray a1, jboolean* a2) {
-    fprintf(stderr, "[jnienv] GetPrimitiveArrayCritical arr=%p\n", (void*)a1);
-    fflush(stderr);
     int64_t r = proxy_jnienv("GetPrimitiveArrayCritical", &a1, sizeof(a1));
-    fprintf(stderr, "[jnienv] GetPrimitiveArrayCritical result=%p\n", (void*)r);
-    fflush(stderr);
+    if (r && g_last_crit_size > 0 && g_crit_count < MAX_CRIT_ARRAYS) {
+        g_crit_arrays[g_crit_count].ptr  = (void*)(intptr_t)r;
+        g_crit_arrays[g_crit_count].size = g_last_crit_size;
+        g_crit_count++;
+        g_last_crit_size = 0;
+    }
     return (void*)(intptr_t)r;
 }
 
 static void proxy_ReleasePrimitiveArrayCritical(JNIEnv* a0, jarray a1, void* a2, jint a3) {
-    // TODO: marshal args into payload
-    int64_t r = proxy_jnienv("ReleasePrimitiveArrayCritical", NULL, 0);
+    if (a3 == JNI_ABORT) return;
+
+    jsize size = 0;
+    for (int i = 0; i < g_crit_count; i++) {
+        if (g_crit_arrays[i].ptr == a2) {
+            size = g_crit_arrays[i].size;
+            g_crit_arrays[i] = g_crit_arrays[--g_crit_count];
+            break;
+        }
+    }
+    if (size <= 0) return;
+
+    uint32_t payload_len = sizeof(a1) + sizeof(a3) + (uint32_t)size;
+    uint8_t *payload = malloc(payload_len);
+    memcpy(payload,                          &a1, sizeof(a1));
+    memcpy(payload + sizeof(a1),             &a3, sizeof(a3));
+    memcpy(payload + sizeof(a1) + sizeof(a3), a2, size);
+    proxy_jnienv("ReleasePrimitiveArrayCritical", payload, payload_len);
+    free(payload);
 }
 
 static const jchar* proxy_GetStringCritical(JNIEnv* a0, jstring a1, jboolean* a2) {
@@ -1035,22 +1079,46 @@ static jboolean proxy_ExceptionCheck(JNIEnv* a0) {
 }
 
 static jobject proxy_NewDirectByteBuffer(JNIEnv* a0, void* a1, jlong a2) {
-    // Send: address(8) + capacity(8) + actual buffer data
-    uint32_t cap = (uint32_t)a2;
-    uint32_t payload_len = sizeof(a1) + sizeof(a2) + cap;
-    uint8_t *payload = malloc(payload_len);
-    memcpy(payload,                    &a1,  sizeof(a1));
-    memcpy(payload + sizeof(a1),       &a2,  sizeof(a2));
-    memcpy(payload + sizeof(a1) + sizeof(a2), a1, cap);  // copy actual data
-    int64_t r = proxy_jnienv("NewDirectByteBuffer", payload, payload_len);
-    free(payload);
+    // Check cache BEFORE sending anything over IPC
+    for (int i = 0; i < g_direct_buf_count; i++) {
+        if (g_direct_bufs[i].arm_handle == (int64_t)(intptr_t)a1) {
+            return (jobject)(intptr_t)g_direct_bufs[i].host_jobject;
+        }
+    }
+
+    // Not seen before
+    uint8_t payload[sizeof(a1) + sizeof(a2)];
+    memcpy(payload,            &a1, sizeof(a1));
+    memcpy(payload+sizeof(a1), &a2, sizeof(a2));
+    int64_t r = proxy_jnienv("NewDirectByteBuffer", payload, sizeof(payload));
+
+    // Store in local cache too
+    if (g_direct_buf_count < MAX_DIRECT_BUFS) {
+        g_direct_bufs[g_direct_buf_count].arm_handle   = (int64_t)(intptr_t)a1;
+        g_direct_bufs[g_direct_buf_count].host_jobject = (jobject)(intptr_t)r;
+        g_direct_buf_count++;
+    }
     return (jobject)(intptr_t)r;
 }
 
 static void* proxy_GetDirectBufferAddress(JNIEnv* a0, jobject a1) {
-    // TODO: marshal args into payload
-    int64_t r = proxy_jnienv("GetDirectBufferAddress", NULL, 0);
-    return (void*)(intptr_t)r;
+    uintptr_t handle = (intptr_t)a1;
+
+    if (handle < 0x10000) {
+        fprintf(stderr, "[jnienv] GetDirectBufferAddress: SUSPICIOUS small value a1=%p\n", (void*)a1);
+        fprintf(stderr, "[jnienv] GetDirectBufferAddress a0=%p\n", (void*)a0);
+
+        fflush(stderr);
+    }
+
+    for (int i = 0; i < g_direct_buf_count; i++) {
+        if (g_direct_bufs[i].arm_handle == handle) {
+            return (void*)(intptr_t)g_direct_bufs[i].arm_handle;
+        }
+    }
+    fprintf(stderr, "[jnienv] GetDirectBufferAddress: no cache entry for %p\n", (void*)a1);
+    fflush(stderr);
+    return NULL;
 }
 
 static jlong proxy_GetDirectBufferCapacity(JNIEnv* a0, jobject a1) {

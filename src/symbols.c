@@ -19,12 +19,35 @@ int symbols_load(const char *path) {
     return 0;
 }
 
+typedef struct {
+    const char *prefix;
+    size_t      prefix_len;
+    void       *result;
+} PrefixSearchCtx;
+
+static void prefix_search_cb(const char *name, void *udata) {
+    PrefixSearchCtx *ctx = udata;
+    if (ctx->result) return; // already found
+    if (strncmp(name, ctx->prefix, ctx->prefix_len) == 0) {
+        // found a prefix match
+        for (int i = 0; i < handle_count; i++) {
+            void *sym = dlsym(handles[i], name);
+            if (sym) { ctx->result = sym; return; }
+        }
+    }
+}
+
 void *symbols_find(const char *name) {
+    // exact match first
     for (int i = 0; i < handle_count; i++) {
         void *sym = dlsym(handles[i], name);
         if (sym) return sym;
     }
-    return NULL;
+
+    // prefix match via ELF walk
+    PrefixSearchCtx ctx = { name, strlen(name), NULL };
+    symbols_foreach(prefix_search_cb, &ctx);
+    return ctx.result;
 }
 
 typedef struct {
@@ -67,7 +90,9 @@ static int phdr_callback(struct dl_phdr_info *info, size_t size, void *data) {
     size_t symcount = hashtab[1];
     for (size_t j = 1; j < symcount; j++) {
         const ElfW(Sym) *sym = (const ElfW(Sym) *)((const char *)symtab + j * syment);
-        if (ELF64_ST_BIND(sym->st_info) == STB_GLOBAL && sym->st_value != 0) {
+        if ((ELF64_ST_BIND(sym->st_info) == STB_GLOBAL || 
+            ELF64_ST_BIND(sym->st_info) == STB_WEAK))
+        {
             state->cb(strtab + sym->st_name, state->udata);
         }
     }
